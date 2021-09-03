@@ -1,0 +1,8 @@
+/scoop-output
+*.html
+*.css
+*.js
+
+.ammonite
+.metals
+.DS_Store
