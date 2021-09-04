@@ -1,8 +1,14 @@
-/scoop-output
+scoop-output*
 *.html
 *.css
 *.js
 
+target
+.bloop
 .ammonite
+.bsp
 .metals
+project/project
+project/metals.sbt
+
 .DS_Store

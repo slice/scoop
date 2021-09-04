@@ -1,27 +1,19 @@
-import $ivy.`org.typelevel::cats-core:2.6.1`, cats._, cats.syntax.all._
-import $ivy.`org.typelevel::cats-effect:3.2.5`, cats.effect._, std._
-import $ivy.`org.http4s::http4s-blaze-client:0.23.3`
-import $ivy.`co.fs2::fs2-core:3.1.1`, fs2._, concurrent._
-import $ivy.`co.fs2::fs2-io:3.1.1`, fs2.io.file.{Files, Flag, Flags}
-import $ivy.`org.slf4j:slf4j-nop:1.7.32`
-import fs2.io.file.Path
-import org.http4s.Uri
-import org.http4s.Request
+package zone.slice.scoop
+
+import cats._
+import cats.syntax.all._
+import cats.effect._
+import cats.effect.std._
+
+import fs2._
+import fs2.concurrent._
+import fs2.io.file._
+
+import org.http4s.{Uri, Request}
 import org.http4s.client.Client
 import org.http4s.blaze.client.BlazeClientBuilder
+
 import scala.util.matching._
-
-def basePageUrl(branch: String): Option[Uri] =
-  (branch match {
-    case "stable"         => "".some
-    case "canary" | "ptb" => (branch + ".").some
-    case _                => none
-  }).map { subdomain =>
-    Uri.unsafeFromString(s"https://${subdomain}discord.com/channels/@me")
-  }
-
-def assetUri(name: String): Uri =
-  Uri.unsafeFromString(s"https://discord.com/assets/$name")
 
 object R {
   val assetHash =
@@ -33,7 +25,7 @@ case class Status(
     discovered: Int = 0,
     fetched: Int = 0,
     skipped: Int = 0,
-    bytesDownloaded: Long = 0
+    bytesDownloaded: Long = 0,
 )
 
 object Status {
@@ -41,8 +33,8 @@ object Status {
     val percentage: Double =
       ((s.fetched.toDouble + s.skipped.toDouble) / s.discovered.toDouble) * 100
     val percentageS = "%.2f".format(percentage)
-    val processed = s.fetched + s.skipped
-    val dled = "%.4f".format(s.bytesDownloaded.toDouble / 1000000d)
+    val processed   = s.fetched + s.skipped
+    val dled        = "%.4f".format(s.bytesDownloaded.toDouble / 1000000d)
     s"""|[$percentageS%] ${s.fetched} fetched +
         | ${s.skipped} skipped = ${processed}/${s.discovered}
         | (${dled} MB dl'ed)""".stripMargin
@@ -50,48 +42,50 @@ object Status {
   }
 }
 
-class Scooper[F[_]](assetQ: Queue[F, Option[String]], status: Ref[F, Status])(
-    maxDownloaders: Int
+class Scooper[F[_]](assetQ: Queue[F, Option[Asset]], status: Ref[F, Status])(
+    maxDownloaders: Int,
 )(implicit
     F: Async[F],
     C: Console[F],
     H: Client[F],
-    FI: Files[F]
+    FI: Files[F],
 ) {
   def addToCounter(
       discovered: Int = 0,
       fetched: Int = 0,
       skipped: Int = 0,
-      bytesDownloaded: Long = 0
+      bytesDownloaded: Long = 0,
   ): F[Unit] =
     status.update { st =>
       st.copy(
         discovered = st.discovered + discovered,
         fetched = st.fetched + fetched,
         skipped = st.skipped + skipped,
-        bytesDownloaded = st.bytesDownloaded + bytesDownloaded
+        bytesDownloaded = st.bytesDownloaded + bytesDownloaded,
       )
     }
 
   def showStatus: F[Unit] =
-    status.get.flatMap(s => C.print(s.show + '\r'))
+    for {
+      status <- status.get
+      _ <- C.print(status.show + '\r')
+      _ <- F.delay(System.out.flush())
+    } yield ()
 
-  def publishAssetNames(matches: Vector[String]): F[Unit] =
-    addToCounter(discovered = matches.length) *> matches
-      .map(n => assetQ.offer(n.some))
+  def publishAssets(assets: Vector[Asset]): F[Unit] =
+    addToCounter(discovered = assets.length) *> assets
+      .map(asset => assetQ.offer(asset.some))
       .sequence_
 
-  def findAllAssetNames(text: String): Vector[Regex.Match] =
+  def findAllAssets(text: String): Vector[Asset] =
     R.assetHash
       .findAllMatchIn(text)
+      .map(name => Asset(name = name.matched))
       .toVector
 
-  def scoop(branch: String): F[Unit] =
+  def scoop(branch: Branch): F[Unit] =
     for {
-      basePageUrl <- basePageUrl(branch).liftTo[F](
-        new RuntimeException("invalid branch. values: stable, canary, ptb")
-      )
-      _ <- C.println(s"downloading entire client from $basePageUrl...")
+      _ <- C.println(s"downloading entire client from ${branch.basePageUri}...")
       outputPath = Path("./scoop-output/")
       _ <- FI
         .isDirectory(outputPath)
@@ -100,20 +94,20 @@ class Scooper[F[_]](assetQ: Queue[F, Option[String]], status: Ref[F, Status])(
         Stream
           .fromQueueNoneTerminated(assetQ)
           .evalTap(_ => showStatus)
-          .evalFilter { name =>
-            FI.exists(outputPath / name)
+          .evalFilter { asset =>
+            FI.exists(outputPath / asset.name)
               .flatTap(addToCounter(skipped = 1).whenA(_))
               .map(!_)
           }
           .evalTap(_ => addToCounter(fetched = 1))
           // .debug(name => s"fetch: $name")
-          .parEvalMapUnordered(maxDownloaders) { name =>
-            H.run(Request[F](uri = assetUri(name))).use { resp =>
+          .parEvalMapUnordered(maxDownloaders) { asset =>
+            H.run(Request[F](uri = asset.uri)).use { resp =>
               resp.body
                 .through[F, Long] { byteStream =>
                   val writeCursor = FI.writeCursor(
-                    outputPath / name,
-                    Flags(Flag.Create, Flag.Write)
+                    outputPath / asset.name,
+                    Flags(Flag.Create, Flag.Write),
                   )
                   Stream
                     .resource(writeCursor)
@@ -121,7 +115,7 @@ class Scooper[F[_]](assetQ: Queue[F, Option[String]], status: Ref[F, Status])(
                       _.writeAll(byteStream)
                         .flatMap(cursor => Pull.output1(cursor.offset))
                         .void
-                        .stream
+                        .stream,
                     )
                 }
                 .evalTap(offset => addToCounter(bytesDownloaded = offset))
@@ -130,39 +124,38 @@ class Scooper[F[_]](assetQ: Queue[F, Option[String]], status: Ref[F, Status])(
             }
           }
       weDoTheScooping = for {
-        basePageHtml <- H.expect[String](basePageUrl)
+        basePageHtml <- H.expect[String](branch.basePageUri)
 
-        hashes = findAllAssetNames(basePageHtml)
+        assets = findAllAssets(basePageHtml)
         // download all base page assets (we'll just refetch O_O)
-        _ <- publishAssetNames(hashes.map(_.matched))
+        _ <- publishAssets(assets)
 
         // specialized scooping behavior for scripts
         // in order: (0) chunk loader, (1) classes, (2) vendor, (3) entrypoint
-        scripts = hashes.map(_.matched).filter(_.endsWith("js"))
+        scripts = assets.filter(_.name.endsWith(".js"))
         // make sure our invariants hold
         expectedScriptTags = 4
         _ <- F
           .raiseError(
             new RuntimeException(
               """|base page does not have the expected amount of <script>s,
-                 | scoop will have to be updated to account for this!""".stripMargin
-            )
+                 | scoop will have to be updated to account for this!""".stripMargin,
+            ),
           )
           .whenA(scripts.length != 4)
 
-        Vector(chunkLoaderName, classesName, vendorName, entrypointName) =
+        Vector(chunkLoaderJS, classesJS, vendorJS, entrypointJS) =
           scripts
 
         // specialized: download chunks from chunk loader
-        chunkLoaderText <- H.expect[String](assetUri(chunkLoaderName))
+        chunkLoaderText <- H.expect[String](chunkLoaderJS.uri)
         // _ <- C.println("*** specialized: finding chunks")
         chunkMatches = R.chunkHash.findAllMatchIn(chunkLoaderText).toVector
-        _ <- publishAssetNames(chunkMatches.map(_.group(2) + ".js"))
+        _ <- publishAssets(chunkMatches.map(_.group(2) + ".js").map(Asset(_)))
 
         // specialiezd: find assets from entrypoint (the bulk of 'em)
-        entrypointText <- H.expect[String](assetUri(entrypointName))
-        assetNames = findAllAssetNames(entrypointText)
-        _ <- publishAssetNames(assetNames.map(_.matched))
+        entrypointText <- H.expect[String](entrypointJS.uri)
+        _ <- publishAssets(findAllAssets(entrypointText))
 
         // close the queue, terminating the dumping stream and ending the
         // program
@@ -177,31 +170,11 @@ class Scooper[F[_]](assetQ: Queue[F, Option[String]], status: Ref[F, Status])(
 object Scooper {
   def apply[F[_]: Async: Console: Client: Files](
       maxQueueSize: Int,
-      maxDownloaders: Int
+      maxDownloaders: Int,
   ): F[Scooper[F]] = for {
-    assetT <- Queue.bounded[F, Option[String]](maxQueueSize)
+    assetQ    <- Queue.bounded[F, Option[Asset]](maxQueueSize)
     statusRef <- Ref.of(Status())
-  } yield new Scooper(assetT, statusRef)(
-    maxDownloaders = maxDownloaders
+  } yield new Scooper(assetQ, statusRef)(
+    maxDownloaders = maxDownloaders,
   )
 }
-
-import scala.concurrent.ExecutionContext.{global => globalEC}
-import cats.effect.unsafe.implicits.global
-@main
-def main(
-    branch: String,
-    maxQueueSize: Int = 128,
-    maxDownloaders: Int = 32
-): Unit = (for {
-  client <- BlazeClientBuilder[IO](globalEC).resource
-  scooper <- Resource.eval(
-    Scooper[IO](maxQueueSize = maxQueueSize, maxDownloaders = maxDownloaders)(
-      Async[IO],
-      Console[IO],
-      client,
-      Files[IO]
-    )
-  )
-  _ <- Resource.eval(scooper.scoop(branch))
-} yield ()).use_.unsafeRunSync()
